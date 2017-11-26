@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+
+import magic
+mime = magic.open(magic.MAGIC_MIME)
+mime.load()
+
+import os
+app_dir = os.path.expanduser('~/.librefm')
+
+import configparser
+config = configparser.ConfigParser()
+config.read(os.path.join(app_dir, 'config'))
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import GLib, Gst
+Gst.init(None)
+
+from sqlalchemy.ext.declarative import declarative_base
+Base = declarative_base()
+
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine, Column, DateTime, Float, Integer, String
+
+#import acoustid
+
+class Scrobble(Base):
+    __tablename__ = 'scrobbles'
+
+    id = Column(Integer, primary_key=True)
+    artist = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    album = Column(String, nullable=False)
+    album_artist = Column(String, nullable=False)
+    track_number = Column(Integer, nullable=False)
+    mbid = Column(String, nullable=False)
+    duration = Column(Float, nullable=False)
+    timestamp = Column(DateTime, nullable=False, default=datetime.now)
+    submitted = Column(DateTime, default=None)
+
+db_path = os.path.realpath(os.path.join(app_dir, 'db.sqlite'))
+engine = create_engine('sqlite:///{}'.format(db_path))
+Base.metadata.create_all(engine)
+
+from sqlalchemy.orm import sessionmaker
+Session = sessionmaker(bind=engine)
+
+import urllib
+import pylast
+import mutagen
+
+class Player:
+
+    def __init__(self, *args):
+
+        self.session = Session()
+        self.network = None
+        self.submit()
+
+        #jackaudiosink = Gst.ElementFactory.make('jackaudiosink', 'sink')
+        #jackaudiosink.set_property('client-name', 'piff')
+        #jackaudiosink.set_property('connect', 'none')
+
+        self.pipeline = Gst.ElementFactory.make('playbin3', 'player')
+        #self.pipeline.set_property('audio-sink', jackaudiosink)
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message', self.on_message)
+
+        self.queue = []
+        cwd = os.getcwd()
+        for arg in args:
+            path = os.path.relpath(arg)
+            if os.path.isdir(path):
+                for file in sorted(os.listdir(path)):
+                    #print(mime.file(os.path.join(path, file)))
+                    if file.endswith('.flac') or file.endswith('.mp3') or file.endswith('.m4a') or file.endswith('.ogg') or file.endswith('.opus'):
+                        self.queue.append(os.path.join(path, file))
+            elif os.path.isfile(path):
+                self.queue.append(path)
+            else:
+                print('* ignored: ', arg)
+
+        self.mainloop = GLib.MainLoop()
+
+
+    def start(self, stdscr = None):
+        if not len(self.queue):
+            return
+        self.playnext()
+        try:
+            self.mainloop.run()
+        except KeyboardInterrupt:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.mainloop.quit()
+
+
+    def playnext(self):
+
+        while True:
+            if not len(self.queue):
+                self.mainloop.quit()
+                return
+
+            audiofile = self.queue.pop(0)
+            d = mutagen.File(audiofile)
+
+            if d is None:
+                print('* unknown format', audiofile)
+            elif isinstance(d, mutagen.mp3.MP3):
+                t = d.tags
+                if t.version == (2, 3, 0) and 'TXXX:MusicBrainz Release Track Id' in d:
+                    track = t['TRCK'][0]
+                    self.info = dict(artist = t['TPE1'][0],
+                                     title = t['TIT2'][0],
+                                     album = t['TALB'][0],
+                                     album_artist = t['TPE2'][0],
+                                     track_number = int(track.split('/')[0]),
+                                     mbid = t['TXXX:MusicBrainz Release Track Id'][0],
+                                     duration = d.info.length)
+                    break
+                else:
+                    print('* not mb/wrong tags', audiofile)
+            elif isinstance(d, mutagen.flac.FLAC):
+                if 'musicbrainz_trackid' in d:
+                    track = '{}/{}'.format(int(d['tracknumber'][0]), int(d['tracktotal'][0]))
+                    self.info = dict(artist = d['artist'][0],
+                                     title = d['title'][0],
+                                     album = d['album'][0],
+                                     album_artist = d['albumartist'][0],
+                                     track_number = int(d['tracknumber'][0]),
+                                     mbid = d['musicbrainz_trackid'][0],
+                                     duration = d.info.length)
+                    break
+                else:
+                    print('* not mb', audiofile)
+            elif isinstance(d, mutagen.mp4.MP4):
+                if '----:com.apple.iTunes:MusicBrainz Release Track Id' in d:
+                    track = '{}/{}'.format(*d['trkn'][0])
+                    self.info = dict(artist = d['©ART'][0],
+                                     title = d['©nam'][0],
+                                     album = d['©alb'][0],
+                                     album_artist = d['soaa'][0],
+                                     track_number = int(d['trkn'][0][0]),
+                                     mbid = str(d['----:com.apple.iTunes:MusicBrainz Release Track Id'][0]),
+                                     duration = d.info.length)
+                    break
+                else:
+                    print('* not mb/wrong tags', audiofile)
+            elif isinstance(d, mutagen.oggopus.OggOpus) or \
+                 isinstance(d, mutagen.oggvorbis.OggVorbis):
+                if 'musicbrainz_releasetrackid' in d:
+                    track = '{}/{}'.format(d['tracknumber'][0], d['tracktotal'][0])
+                    self.info = dict(artist = d['artist'][0],
+                                     title = d['title'][0],
+                                     album = d['album'][0],
+                                     album_artist = d['albumartist'][0],
+                                     track_number = int(d['tracknumber'][0]),
+                                     mbid = d['musicbrainz_releasetrackid'][0],
+                                     duration = d.info.length)
+                    break
+                else:
+                    print('* not mb/wrong tags', audiofile)
+            else:
+                print('* unmanaged format', audiofile, d.__class__.__name__)
+
+        print('[{}] {} — {} [{}]'.format(track, self.info['artist'], self.info['title'],
+                                         '{:.0f}:{:02.0f}'.format(*divmod(d.info.length, 60))))
+
+        if self.network:
+            try:
+                self.network.update_now_playing(**self.info)
+            except:
+                print('* now playing: error')
+
+        uri = 'file://'+urllib.parse.quote(os.path.abspath(audiofile))
+        self.pipeline.set_property('uri', uri)
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+
+    def on_message(self, bus, message):
+
+        if message.type is Gst.MessageType.ERROR:
+            self.pipeline.set_state(Gst.State.NULL)
+            err, debug = message.parse_error()
+            print(err, debug)
+            return
+        elif message.type is not Gst.MessageType.EOS:
+            return
+
+        scrobble = Scrobble(**self.info)
+        self.session.add(scrobble)
+        self.session.commit()
+
+        self.submit()
+
+        self.pipeline.set_state(Gst.State.READY)
+        self.playnext()
+
+
+    def authenticate(self):
+
+        if self.network:
+            return
+
+        try:
+            self.network = pylast.LibreFMNetwork(
+                api_key = config['api']['key'],
+                api_secret = config['api']['secret'],
+                username = config['librefm']['username'],
+                password_hash = pylast.md5(config['librefm']['password']))
+        except Exception as e:
+            print('* authenticate: error', e)
+            return
+
+        print('* authenticate: ok')
+
+
+    def submit(self):
+
+        scrobbles = self.session.query(Scrobble).filter(Scrobble.submitted == None).order_by(Scrobble.timestamp)
+
+        tracks = [ dict(artist = s.artist,
+                        title = s.title,
+                        album = s.album,
+                        album_artist = s.album_artist,
+                        track_number = s.track_number,
+                        mbid = s.mbid,
+                        duration = s.duration,
+                        timestamp = s.timestamp.strftime('%s')) for s in scrobbles ]
+
+        if not len(tracks):
+            return
+
+        if self.network is None:
+            self.authenticate()
+
+        if self.network is None:
+            return
+
+        try:
+            self.network.scrobble_many(tracks)
+        except:
+            print('* submit: error')
+            return
+
+        print('* submit:', len(tracks))
+
+        now = datetime.now()
+        for s in scrobbles:
+            s.submitted = now
+        self.session.commit()
+
+
+import sys
+player = Player(*sys.argv[1:])
+player.authenticate()
+player.start()
