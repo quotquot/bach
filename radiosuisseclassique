@@ -1,0 +1,2 @@
+#!/usr/bin/zsh
+mplayer -quiet http://stream.srg-ssr.ch/m/rsc_fr/aacp_96 |& ./libre-icy "StreamTitle='(?P<composer>.*) - (?P<title>.*)';$"

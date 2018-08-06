@@ -1,0 +1,93 @@
+#!/usr/bin/python3.7 -u
+
+import re
+import sys
+import time
+import pylast
+import select
+import calendar
+
+class LibreFM:
+
+    def __init__(self, api_key, api_secret, username, password):
+        self.timestamp = None
+        self.composer = None
+        self.title = None
+        self.prev_timestamp = None
+        self.prev_composer = None
+        self.prev_title = None
+        self.count = 0
+        self.radio = None
+        self.icyre = re.compile("^ICY Info: StreamTitle='(?P<composer>.*) - (?P<title>.*)';$")
+        self.network = pylast.LibreFMNetwork(
+            api_key=api_key,
+            api_secret=api_secret,
+            username=username,
+            password_hash=pylast.md5(password))
+
+    def process_line(self, line):
+
+        if self.radio is None and line.startswith('Name   : '):
+            self.radio = line[9:]
+            return
+
+        if not line.startswith('ICY Info') or \
+           line == "ICY Info: StreamTitle='Radio Suisse Classique - www.radiosuisseclassique.ch';" or \
+           line == "ICY Info: StreamTitle='Audiophile Stream Network - Donation - http://stream.psychomed.gr, email:stream@psychomed.gr';StreamUrl='';":
+            return
+
+        self.prev_title = self.title
+        self.prev_composer = self.composer
+        self.prev_timestamp = self.timestamp
+
+        self.timestamp = time.gmtime()
+        self.count += 1
+
+        m = self.icyre.match(line)
+
+        if not m:
+            print('Incorrect Format:', line)
+            self.timestamp = None
+            self.composer = None
+            self.title = None
+            self.count = 0
+            return
+
+        info = m.groupdict()
+
+        self.composer = info['composer']
+        self.title = '[{}] {}'.format(self.radio, info['title'])
+
+        if self.count > 2:
+            self.network.scrobble(self.prev_composer,
+                                  self.prev_title,
+                                  calendar.timegm(self.prev_timestamp))
+            print('[submitted]')
+        else:
+            print()
+
+        self.network.update_now_playing(self.composer, self.title)
+        print(time.strftime('%H:%M', time.localtime(calendar.timegm(self.timestamp))), '-', self.title, 'by', self.composer, '',)
+
+
+import os
+app_dir = os.path.expanduser('~/.librefm')
+
+import configparser
+config = configparser.ConfigParser()
+config.read(os.path.join(app_dir, 'config'))
+
+librefm = LibreFM(api_key=config['api']['key'],
+                  api_secret=config['api']['secret'],
+                  username=config['librefm']['username'],
+                  password=config['librefm']['password'])
+
+sys.stdin.reconfigure(encoding='latin1')
+
+while True:
+    while sys.stdin in select.select([sys.stdin], [], [], 1)[0]:
+      line = sys.stdin.readline()
+      if line:
+          librefm.process_line(line.rstrip())
+      else:
+        exit(0)
